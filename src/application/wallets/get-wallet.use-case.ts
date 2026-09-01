@@ -30,6 +30,12 @@ export async function getWalletLedger(
   limit: number,
   cursor?: string,
 ): Promise<LedgerPage> {
+  // Sem isso, consultar o extrato de uma wallet que não existe retornava 200 com
+  // uma lista vazia — inconsistente com GET /wallets/:walletId, que corretamente
+  // devolve 404 pro mesmo caso. Mesmo recurso, mesmo comportamento esperado.
+  const walletExists = await manager.getRepository(WalletEntity).exist({ where: { id: walletId } });
+  if (!walletExists) throw new WalletNotFoundError(walletId);
+
   const repo = manager.getRepository(WalletLedgerEntryEntity);
   const qb = repo
     .createQueryBuilder('e')

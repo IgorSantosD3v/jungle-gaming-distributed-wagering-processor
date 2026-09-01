@@ -14,6 +14,8 @@ import { v4 as uuid } from 'uuid';
 import { AppDataSource } from '../../src/infra/database/data-source';
 import { createWallet } from '../../src/application/wallets/create-wallet.use-case';
 import { submitWagerTransaction } from '../../src/application/wagering/submit-wager-transaction.use-case';
+import { getWallet, getWalletLedger } from '../../src/application/wallets/get-wallet.use-case';
+import { WalletNotFoundError } from '../../src/application/wagering/wagering.errors';
 import { Money } from '../../src/domain/money/money';
 import { WagerTransactionKind, WagerTransactionStatus } from '../../src/domain/wager-transaction/wager-transaction';
 import { OutboxMessageEntity, InboxMessageEntity } from '../../src/infra/database/entities/messaging.entity';
@@ -164,5 +166,26 @@ describe('Inbox: dedup and redelivery', () => {
   it('a second insert for the same (consumer, messageId) violates the unique constraint', async () => {
     await dataSource.getRepository(InboxMessageEntity).insert({ consumerName: 'c1', messageId: 'm1', payloadHash: 'h1' });
     await expect(dataSource.getRepository(InboxMessageEntity).insert({ consumerName: 'c1', messageId: 'm1', payloadHash: 'h1' })).rejects.toThrow();
+  });
+});
+
+describe('Wallet lookups are consistent between GET /wallets/:id and GET /wallets/:id/ledger', () => {
+  it('GET /wallets/:id 404s for a non-existent wallet', async () => {
+    await expect(dataSource.transaction((m) => getWallet(m, uuid()))).rejects.toBeInstanceOf(WalletNotFoundError);
+  });
+
+  it('GET /wallets/:id/ledger ALSO 404s for a non-existent wallet, not a silent empty list', async () => {
+    // Antes da correção, isso retornava 200 com uma lista vazia — inconsistente
+    // com o endpoint de wallet, que corretamente rejeita o mesmo caso.
+    await expect(dataSource.transaction((m) => getWalletLedger(m, uuid(), 50))).rejects.toBeInstanceOf(WalletNotFoundError);
+  });
+
+  it('GET /wallets/:id/ledger succeeds (possibly empty) for a wallet that exists but has no entries', async () => {
+    const playerId = uuid();
+    const wallet = await dataSource.transaction((m) =>
+      createWallet(m, { playerId, initialBalance: Money.zero('BRL'), correlationId: 'setup' }),
+    );
+    const page = await dataSource.transaction((m) => getWalletLedger(m, wallet.id, 50));
+    expect(page.entries).toEqual([]);
   });
 });

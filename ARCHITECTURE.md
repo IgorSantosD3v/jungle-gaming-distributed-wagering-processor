@@ -233,6 +233,17 @@ fechar esse gap revelou dois bugs reais:
    qualquer chamada ao banco. Testado com `walletId`/`playerId` malformados e
    com `providerId` ausente.
 
+4. **`GET /wallets/:id/ledger` não checava se a wallet existia.**
+   `GET /wallets/:id` corretamente devolve 404 para uma wallet inexistente,
+   mas `GET /wallets/:id/ledger` simplesmente consultava a tabela de ledger
+   filtrando por `wallet_id` — para uma wallet que nunca existiu, isso
+   silenciosamente retornava `200` com uma lista vazia, em vez de `404`. Mesmo
+   recurso (a wallet), dois endpoints com comportamentos inconsistentes para
+   o mesmo caso de erro. Corrigido adicionando uma checagem de existência no
+   início de `getWalletLedger()`, antes de consultar o ledger — agora lança o
+   mesmo `WalletNotFoundError` que `getWallet()` já lançava. Testado em
+   `test/integration/persistence.spec.ts`.
+
 ## 7. Referências fora de ordem (seção 7.1)
 
 Quando REFUND/ROLLBACK chega antes da transação que referencia, a transação fica
