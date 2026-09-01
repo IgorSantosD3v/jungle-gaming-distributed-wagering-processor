@@ -79,6 +79,12 @@ export class MetricsService {
     registers: [this.registry],
   });
 
+  readonly reconciliationDivergencesTotal = new Counter({
+    name: 'wallet_reconciliation_divergences_total',
+    help: 'Total de divergências encontradas entre o saldo materializado e o saldo reconstruído pelo ledger',
+    registers: [this.registry],
+  });
+
   /** Postgres SQLSTATE 40P01 = deadlock_detected. */
   isDeadlockError(err: unknown): boolean {
     const e = err as { code?: string; driverError?: { code?: string } };

@@ -1,47 +1,30 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { DataSource } from 'typeorm';
-import { DeleteMessageCommand, ReceiveMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import {
+  ChangeMessageVisibilityCommand,
+  DeleteMessageCommand,
+  ReceiveMessageCommand,
+  SendMessageCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
 import type { Message } from '@aws-sdk/client-sqs';
-import { createHash } from 'node:crypto';
-import { InboxMessageEntity } from '../database/entities/messaging.entity';
-import { submitWagerTransaction } from '../../application/wagering/submit-wager-transaction.use-case';
-import { WagerTransactionKind } from '../../domain/wager-transaction/wager-transaction';
-import { Money } from '../../domain/money/money';
-import { IdempotencyConflictError } from '../../application/wagering/wagering.errors';
-import { DomainError } from '../../domain/money/money.errors';
 import { MetricsService } from '../observability/metrics.service';
-import { recordTransactionMetrics } from '../observability/record-transaction-metrics';
+import { processIncomingMessage, WAGER_TRANSACTIONS_CONSUMER_NAME } from './process-incoming-message';
 
-const CONSUMER_NAME = 'wager-transactions-consumer';
-
-interface WagerTransactionRequestedEnvelope {
-  messageId: string;
-  type: string;
-  occurredAt: string;
-  data: {
-    providerId: string;
-    externalTransactionId: string;
-    idempotencyKey: string;
-    playerId: string;
-    walletId: string;
-    roundId: string;
-    gameId: string;
-    kind: WagerTransactionKind;
-    money: { amount: string; currency: string };
-    referenceExternalTransactionId?: string;
-  };
-}
+const MAX_BACKOFF_SECONDS = 60;
+const BASE_BACKOFF_SECONDS = 5;
 
 /**
  * Consome `wager-transactions.fifo`. Regras cumpridas aqui (seção 10):
  *  - dedup via inbox persistente por (consumerName, messageId) — checada e marcada
- *    DENTRO da mesma transação do use case, não antes/depois;
+ *    DENTRO da mesma transação do use case, não antes/depois (ver process-incoming-message.ts);
  *  - ack (delete da fila) só depois do commit;
- *  - distingue erro de negócio (terminal -> ack, o resultado já foi persistido como
- *    REJECTED/PROCESSED) de erro transitório (não deleta -> SQS reentrega) e erro
- *    permanente de payload (ack + loga, não faz sentido reenviar um payload inválido
- *    indefinidamente — depois de N tentativas o próprio SQS manda para a DLQ via
- *    redrive policy configurada no LocalStack, ver docker/localstack-init.sh);
+ *  - distingue TRÊS categorias, explicitamente, não duas: erro de negócio (ack — o
+ *    resultado já foi persistido), erro transitório (retry com backoff real via
+ *    ChangeMessageVisibility, não apenas "esperar o timeout fixo passar"), e erro
+ *    permanente (DLQ imediata, publicada pelo próprio código — não esperamos o
+ *    maxReceiveCount do SQS esgotar sozinho para um payload que sabemos, de cara,
+ *    que nunca vai processar);
  *  - SIGTERM: para de puxar novas mensagens e aguarda as em andamento (ver onModuleDestroy).
  */
 @Injectable()
@@ -65,24 +48,22 @@ export class WagerTransactionsConsumer implements OnModuleInit, OnModuleDestroy 
   }
 
   async onModuleDestroy(): Promise<void> {
-    this.logger.log('Shutdown signal received — no longer polling for new messages');
+    this.logger.log({ event: 'consumer_shutdown_started' });
     this.running = false;
     await this.loopPromise;
-    // Espera as mensagens em processamento terminarem antes de deixar o processo morrer,
-    // em vez de devolver a visibilidade e potencialmente processar duas vezes ao mesmo tempo.
     if (this.inFlight > 0) {
-      this.logger.log(`Waiting for ${this.inFlight} in-flight message(s) to finish before shutting down`);
+      this.logger.log({ event: 'consumer_shutdown_waiting_in_flight', inFlight: this.inFlight });
     }
     while (this.inFlight > 0) {
       await sleep(100);
     }
-    this.logger.log('Shutdown complete — no messages left in flight');
+    this.logger.log({ event: 'consumer_shutdown_complete' });
   }
 
   private async pollLoop(): Promise<void> {
     const queueUrl = process.env.SQS_QUEUE_URL;
     if (!queueUrl) {
-      this.logger.warn('SQS_QUEUE_URL not set — consumer disabled');
+      this.logger.warn({ event: 'consumer_disabled', reason: 'SQS_QUEUE_URL not set' });
       return;
     }
     while (this.running) {
@@ -93,12 +74,13 @@ export class WagerTransactionsConsumer implements OnModuleInit, OnModuleDestroy 
             MaxNumberOfMessages: 10,
             WaitTimeSeconds: 5,
             VisibilityTimeout: 30,
+            MessageSystemAttributeNames: ['ApproximateReceiveCount'],
           }),
         );
         const messages = result.Messages ?? [];
         await Promise.all(messages.map((m) => this.handle(queueUrl, m)));
       } catch (err) {
-        this.logger.error(`Poll loop error: ${(err as Error).message}`);
+        this.logger.error({ event: 'poll_loop_error', errorMessage: (err as Error).message });
         await sleep(1000);
       }
     }
@@ -109,61 +91,66 @@ export class WagerTransactionsConsumer implements OnModuleInit, OnModuleDestroy 
     try {
       if (!message.Body || !message.MessageId) return;
 
-      let shouldAck = true;
-      let envelope: WagerTransactionRequestedEnvelope | undefined;
-      try {
-        envelope = JSON.parse(message.Body);
-        if (!envelope) throw new Error('Empty envelope');
-        const payloadHash = createHash('sha256').update(JSON.stringify(envelope.data)).digest('hex');
+      const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? '1');
+      const outcome = await processIncomingMessage(this.dataSource, this.metrics, WAGER_TRANSACTIONS_CONSUMER_NAME, message.Body);
 
-        await this.dataSource.transaction(async (manager) => {
-          const inboxRepo = manager.getRepository(InboxMessageEntity);
-          const existingInbox = await inboxRepo.findOneBy({ consumerName: CONSUMER_NAME, messageId: envelope!.messageId });
-          if (existingInbox?.processedAt) {
-            // Redelivery de uma mensagem que já processamos por completo — ack sem reprocessar.
-            return;
-          }
-          if (!existingInbox) {
-            await inboxRepo.insert({ consumerName: CONSUMER_NAME, messageId: envelope!.messageId, payloadHash, receivedAt: new Date() });
-          }
-
-          const result = await submitWagerTransaction(manager, {
-            idempotencyKey: envelope!.data.idempotencyKey,
-            providerId: envelope!.data.providerId,
-            externalTransactionId: envelope!.data.externalTransactionId,
-            playerId: envelope!.data.playerId,
-            walletId: envelope!.data.walletId,
-            roundId: envelope!.data.roundId,
-            gameId: envelope!.data.gameId,
-            kind: envelope!.data.kind,
-            money: Money.from(envelope!.data.money),
-            referenceExternalTransactionId: envelope!.data.referenceExternalTransactionId,
-            correlationId: envelope!.messageId,
+      switch (outcome.action) {
+        case 'ack': {
+          this.logger.log({
+            event: outcome.note ? 'message_ack_business_terminal' : 'message_ack_processed',
+            messageId: message.MessageId,
+            ...outcome.context,
+            note: outcome.note,
           });
-          recordTransactionMetrics(this.metrics, envelope!.data.kind, result);
-
-          await inboxRepo.update({ consumerName: CONSUMER_NAME, messageId: envelope!.messageId }, { processedAt: new Date() });
-        });
-      } catch (err) {
-        if (err instanceof IdempotencyConflictError || err instanceof DomainError) {
-          // Erro de negócio/validação — não é transitório, reenviar não vai ajudar.
-          // O resultado (se houver) já foi persistido pelo use case; aqui só logamos e damos ack.
-          this.logger.warn(`Business/validation error for message ${envelope?.messageId ?? message.MessageId}: ${err.message}`);
-        } else {
-          if (this.metrics.isDeadlockError(err)) this.metrics.lockConflictsTotal.inc();
-          // Falha transitória (Postgres fora do ar, timeout de lock) OU payload malformado
-          // (JSON inválido, campos ausentes) — em ambos os casos NÃO ack. Um payload
-          // malformado não deve travar o consumidor nem ser descartado silenciosamente:
-          // ele fica visível de novo, é reentregue, e depois de maxReceiveCount tentativas
-          // o próprio SQS o move para a DLQ via redrive policy — ver docker/localstack-init.sh.
-          this.logger.error(`Transient/malformed message ${envelope?.messageId ?? message.MessageId}: ${(err as Error).message}`);
-          this.metrics.sqsRedeliveriesTotal.inc();
-          shouldAck = false;
+          if (message.ReceiptHandle) {
+            await this.sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }));
+          }
+          break;
         }
-      }
-
-      if (shouldAck && message.ReceiptHandle) {
-        await this.sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }));
+        case 'retry': {
+          this.metrics.sqsRedeliveriesTotal.inc();
+          const backoffSeconds = Math.min(BASE_BACKOFF_SECONDS * 2 ** receiveCount, MAX_BACKOFF_SECONDS);
+          this.logger.warn({
+            event: 'message_retry_scheduled',
+            messageId: message.MessageId,
+            reason: outcome.reason,
+            receiveCount,
+            backoffSeconds,
+            ...outcome.context,
+          });
+          // Backoff real: em vez de deixar a mensagem reaparecer só depois do
+          // VisibilityTimeout fixo da fila (30s sempre), estendemos a visibilidade
+          // com um valor que cresce a cada tentativa — a próxima reentrega demora
+          // mais quanto mais vezes já falhou.
+          if (message.ReceiptHandle) {
+            await this.sqs.send(
+              new ChangeMessageVisibilityCommand({
+                QueueUrl: queueUrl,
+                ReceiptHandle: message.ReceiptHandle,
+                VisibilityTimeout: backoffSeconds,
+              }),
+            );
+          }
+          break;
+        }
+        case 'dead_letter': {
+          this.logger.error({ event: 'message_dead_lettered', messageId: message.MessageId, reason: outcome.reason, ...outcome.context });
+          const dlqUrl = process.env.SQS_DLQ_URL;
+          if (dlqUrl) {
+            await this.sqs.send(
+              new SendMessageCommand({
+                QueueUrl: dlqUrl,
+                MessageBody: message.Body,
+                MessageGroupId: 'dead-lettered-by-consumer',
+                MessageDeduplicationId: message.MessageId,
+              }),
+            );
+          }
+          if (message.ReceiptHandle) {
+            await this.sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }));
+          }
+          break;
+        }
       }
     } finally {
       this.inFlight -= 1;

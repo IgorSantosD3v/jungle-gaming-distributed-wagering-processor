@@ -43,7 +43,7 @@ export class PendingReferenceWorker implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     this.running = false;
     await this.loopPromise;
-    this.logger.log('Pending-reference worker stopped');
+    this.logger.log({ event: 'pending_reference_worker_stopped' });
   }
 
   private async loop(): Promise<void> {
@@ -52,7 +52,7 @@ export class PendingReferenceWorker implements OnModuleInit, OnModuleDestroy {
         const processed = await this.processDueBatch();
         if (processed === 0) await sleep(POLL_INTERVAL_MS);
       } catch (err) {
-        this.logger.error(`Pending-reference loop error: ${(err as Error).message}`);
+        this.logger.error({ event: 'pending_reference_loop_error', errorMessage: (err as Error).message });
         await sleep(POLL_INTERVAL_MS);
       }
     }
@@ -89,6 +89,13 @@ export class PendingReferenceWorker implements OnModuleInit, OnModuleDestroy {
       // e incrementamos attempts/backoff aqui.
       const tx = wagerTransactionToDomain(row);
       this.metrics.pendingReferenceRetriesTotal.inc();
+      this.logger.log({
+        event: 'pending_reference_retry_attempt',
+        transactionId: row.id,
+        providerId: row.providerId,
+        walletId: row.walletId,
+        attempt: row.referenceAttempts + 1,
+      });
       const result = await this.dataSource.transaction((manager) =>
         submitWagerTransaction(manager, {
           idempotencyKey: tx.idempotencyKey,
@@ -111,7 +118,7 @@ export class PendingReferenceWorker implements OnModuleInit, OnModuleDestroy {
       // Se saiu de PENDING_REFERENCE (PROCESSED ou REJECTED por outro motivo de
       // negócio), o próprio use case já persistiu tudo e publicou o evento certo.
     } catch (err) {
-      this.logger.warn(`Retry failed for transaction ${row.id}: ${(err as Error).message}`);
+      this.logger.warn({ event: 'pending_reference_retry_failed', transactionId: row.id, providerId: row.providerId, walletId: row.walletId, errorMessage: (err as Error).message });
       await this.scheduleNextAttempt(row);
     }
   }
@@ -139,7 +146,13 @@ export class PendingReferenceWorker implements OnModuleInit, OnModuleDestroy {
       await writeToOutbox(manager, WagerTransactionRejected.from(tx, { correlationId: `pending-reference-worker:${tx.id}` }));
     });
     this.metrics.pendingReferenceTimeoutsTotal.inc();
-    this.logger.warn(`Transaction ${row.id} gave up waiting for reference after ${MAX_REFERENCE_ATTEMPTS} attempts`);
+    this.logger.warn({
+      event: 'pending_reference_timeout',
+      transactionId: row.id,
+      providerId: row.providerId,
+      walletId: row.walletId,
+      maxAttempts: MAX_REFERENCE_ATTEMPTS,
+    });
   }
 }
 

@@ -1,4 +1,4 @@
-import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus } from '@nestjs/common';
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import type { Response } from 'express';
 import { DomainError } from '../../domain/money/money.errors';
 import { WalletNotFoundError, WalletAlreadyExistsError, IdempotencyConflictError } from '../../application/wagering/wagering.errors';
@@ -13,6 +13,8 @@ import { WagerTransactionNotFoundError } from '../../application/wagering/get-wa
  */
 @Catch()
 export class DomainExceptionFilter implements ExceptionFilter {
+  private readonly logger = new Logger(DomainExceptionFilter.name);
+
   catch(exception: unknown, host: ArgumentsHost): void {
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();
@@ -39,8 +41,16 @@ export class DomainExceptionFilter implements ExceptionFilter {
 
     // Erro não mapeado: tratamos como falha transitória de infraestrutura (Postgres/SQS
     // fora do ar, timeout de lock, etc.) — nunca vaza stack trace para o provedor.
-    // eslint-disable-next-line no-console
-    console.error('Unhandled error', exception);
+    //
+    // IMPORTANTE: nunca logamos o objeto `exception` bruto. Um erro do driver do
+    // Postgres (QueryFailedError) carrega `.query` e `.parameters` — a query SQL
+    // completa com os valores reais, incluindo dinheiro e IDs. Extraímos só
+    // `name`/`message`/`stack`, nunca o objeto inteiro.
+    const err = exception as { name?: string; message?: string; stack?: string } | undefined;
+    this.logger.error(
+      { event: 'unhandled_error', errorName: err?.name ?? 'UnknownError', errorMessage: err?.message ?? String(exception) },
+      err?.stack,
+    );
     response.status(HttpStatus.SERVICE_UNAVAILABLE).json({ code: 'INFRA_TEMPORARILY_UNAVAILABLE', message: 'Temporarily unavailable, please retry.' });
   }
 }

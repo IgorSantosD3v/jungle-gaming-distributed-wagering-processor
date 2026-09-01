@@ -203,6 +203,34 @@ real (a desordem esperada é de segundos, não minutos). Esgotado o limite, a tr
 vira `REJECTED` com `REFERENCE_NOT_FOUND_TIMEOUT`, permanecendo auditável (nunca
 apagada).
 
+## 7.1 Processamento SQS — três categorias de erro, explicitamente (seção 10)
+
+`WagerTransactionsConsumer` delega a decisão real para `processIncomingMessage`
+(`src/infra/messaging/process-incoming-message.ts`), uma função pura testável sem
+SQS — só recebe o corpo bruto da mensagem e devolve uma de três ações. O
+consumidor (a camada fina que fala com o SQS de verdade) executa o efeito
+correspondente:
+
+| Ação | Quando | O que o consumidor faz |
+|---|---|---|
+| `ack` | Erro de negócio (terminal, ex.: `IdempotencyConflictError`) ou sucesso | `DeleteMessage` — o resultado já está persistido, reenviar não muda nada |
+| `retry` | Falha transitória (Postgres fora do ar, timeout de lock, deadlock) | `ChangeMessageVisibility` com backoff real: `5 * 2^tentativa` segundos, capado em 60s — não apenas "esperar o VisibilityTimeout fixo de 30s passar sempre" |
+| `dead_letter` | Erro permanente — JSON inválido, campos obrigatórios ausentes | `SendMessage` direto para `SQS_DLQ_URL` + `DeleteMessage` da fila principal — **imediato**, não esperamos o `maxReceiveCount` do SQS esgotar sozinho para um payload que já sabemos, de cara, que nunca vai processar |
+
+Essa terceira via (dead-letter imediata pelo próprio código) é uma mudança
+deliberada em relação a uma versão anterior deste projeto, que deixava até
+payloads malformados serem redescobertos e reentregues pelo SQS até o
+`maxReceiveCount` (5 tentativas, ~2-3 minutos) esgotar sozinho antes de cair na
+DLQ via redrive policy. Isso ainda funciona como rede de segurança (a redrive
+policy continua configurada em `docker/localstack-init.sh`), mas agora é a
+exceção, não o caminho principal — mensagens que sabemos ser irrecuperáveis são
+identificadas e roteadas em milissegundos, não minutos.
+
+`processIncomingMessage` é o que torna testável, sem mocks de SQS, o cenário
+"worker morto depois do commit e antes do ack" (seção 13): chamar a função duas
+vezes com o EXATO mesmo corpo de mensagem simula precisamente uma redelivery —
+ver `test/integration/consumer-crash-recovery.spec.ts`.
+
 ## 8. Taxonomia de failure codes
 
 Ver `src/domain/wager-transaction/failure-code.ts`. Convenção de prefixo
@@ -237,8 +265,19 @@ Ver `src/interfaces/http/domain-exception.filter.ts` e
 
 ## 10. Observabilidade
 
-Logs estruturados via `Logger` do NestJS nos workers (mensagens incluem
-`transactionId`/`messageId` quando relevante).
+**Logs estruturados (JSON)** — `StructuredLogger`
+(`src/infra/observability/structured-logger.ts`), registrado como o logger da
+aplicação inteira em `main.ts`. Cada linha de log é um único objeto JSON, não
+texto livre; isso vale automaticamente para todo `new Logger(contexto)` usado em
+qualquer arquivo, incluindo o próprio bootstrap do Nest. Nos pontos de negócio
+(controller de wagering, consumidor SQS, os dois workers), os logs carregam os
+campos padronizados exigidos pela seção 12 quando fazem sentido para aquele
+evento: `correlationId`, `messageId` (via `context` do evento), `transactionId`,
+`walletId`, `providerId`. Nenhum log inclui o valor monetário em si nem o
+payload financeiro completo — `StructuredLogger` redige automaticamente chaves
+como `money`, `amount`, `balance`, `payload`, `parameters` e `query` (essa
+última é o que impediria, por exemplo, que um erro bruto do driver do Postgres
+vazasse a query SQL completa com os valores reais nos logs).
 
 **Métricas Prometheus** (`GET /metrics`, formato texto padrão, sem autenticação —
 mesma categoria dos health checks) via `prom-client`, centralizadas em
@@ -254,9 +293,10 @@ mesma categoria dos health checks) via `prom-client`, centralizadas em
 | `outbox_publish_retries_total` | Counter | Falhas de publicação que geraram retry agendado |
 | `outbox_lag_seconds` | Gauge | Idade do evento pendente mais antigo na outbox |
 | `wallet_lock_conflicts_total` | Counter | Deadlocks detectados pelo Postgres (SQLSTATE `40P01`) |
-| `sqs_redeliveries_total` | Counter | Mensagens SQS não confirmadas, deixadas para reentrega |
+| `sqs_redeliveries_total` | Counter | Mensagens SQS não confirmadas, deixadas para reentrega (categoria `retry`) |
 | `sqs_dlq_depth` | Gauge | Profundidade aproximada da dead-letter queue |
 | `wager_transaction_processing_duration_seconds{kind}` | Gauge | Latência da última chamada a `submitWagerTransaction` no endpoint HTTP |
+| `wallet_reconciliation_divergences_total` | Counter | Divergências encontradas entre saldo materializado e saldo reconstruído pelo ledger (deveria ficar sempre em zero — ver `POST /wallets/:id/reconciliation`) |
 
 `outbox_lag_seconds` e `sqs_dlq_depth` são recalculadas a cada scrape do
 `/metrics` (consulta ao Postgres e ao SQS no momento da requisição), não por um
@@ -281,3 +321,22 @@ separados de liveness/readiness.
   código de aplicação expor um caminho de update para essa tabela.
 - **Teste de carga** (`bun run test:load`): não implementado — diferencial opcional.
 
+## 12. Testes que fecham cenários específicos da seção 13
+
+Além dos arquivos já descritos no README, três specs cobrem cenários exigidos
+pela seção 13 que exigiram extrair lógica de negócio para funções puras
+testáveis, fora dos workers do NestJS:
+
+- `test/integration/consumer-crash-recovery.spec.ts` — "worker morto depois do
+  commit e antes do ack", testado chamando `processIncomingMessage` duas vezes
+  com o mesmo corpo de mensagem (simula a redelivery que o SQS faria de
+  verdade), e confirmando que nenhum efeito financeiro se repete.
+- `test/integration/outbox-concurrent-publishers.spec.ts` — "dois publishers
+  concorrentes sobre a mesma outbox" (chamando `publishOutboxBatch` duas vezes
+  em paralelo) e "reinício do serviço com comprovação da consistência final"
+  (processa transações sem publicar, depois "reinicia" com uma instância nova
+  do publisher e confirma reconciliação consistente antes e depois).
+- `test/concurrency/three-instances.spec.ts` — três (e cinco) processos
+  literalmente separados do sistema operacional (via `Bun.spawn`, não apenas
+  conexões concorrentes dentro do mesmo processo Bun) disputando a mesma
+  wallet, cada um com sua própria conexão independente ao Postgres.

@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Get, HttpCode, HttpStatus, Headers, Param, Post, Res, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, HttpCode, HttpStatus, Headers, Logger, Param, Post, Res, UseGuards } from '@nestjs/common';
 import type { Response } from 'express';
 import { DataSource } from 'typeorm';
 import { SubmitWagerTransactionDto } from './dto/wager-transaction.dto';
@@ -13,6 +13,8 @@ import { recordTransactionMetrics } from '../../infra/observability/record-trans
 @Controller()
 @UseGuards(AuthGuard)
 export class WageringController {
+  private readonly logger = new Logger(WageringController.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly metrics: MetricsService,
@@ -28,6 +30,7 @@ export class WageringController {
       throw new BadRequestException({ code: 'VALIDATION_INVALID_PAYLOAD', message: 'Idempotency-Key header is required' });
     }
 
+    const correlationId = crypto.randomUUID();
     const startedAt = process.hrtime.bigint();
     let result: SubmitWagerTransactionResult;
     try {
@@ -43,16 +46,29 @@ export class WageringController {
           kind: dto.kind as unknown as WagerTransactionKind,
           money: Money.from(dto.money),
           referenceExternalTransactionId: dto.referenceExternalTransactionId,
-          correlationId: crypto.randomUUID(),
+          correlationId,
         }),
       );
     } catch (err) {
-      if (this.metrics.isDeadlockError(err)) this.metrics.lockConflictsTotal.inc();
+      if (this.metrics.isDeadlockError(err)) {
+        this.metrics.lockConflictsTotal.inc();
+        this.logger.warn({ event: 'wallet_lock_conflict', correlationId, walletId: dto.walletId, providerId: dto.providerId });
+      }
       throw err;
     }
     const elapsedSeconds = Number(process.hrtime.bigint() - startedAt) / 1e9;
     this.metrics.transactionProcessingDurationSeconds.labels(dto.kind).set(elapsedSeconds);
     recordTransactionMetrics(this.metrics, dto.kind, result);
+
+    this.logger.log({
+      event: 'wager_transaction_submitted',
+      correlationId,
+      transactionId: result.transactionId,
+      walletId: dto.walletId,
+      providerId: dto.providerId,
+      status: result.status,
+      idempotentReplay: result.idempotentReplay,
+    });
 
     res.status(httpStatusFor(result));
     return {

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Logger, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { CreateWalletDto, LedgerQueryDto } from './dto/wallet.dto';
 import { Money } from '../../domain/money/money';
@@ -14,6 +14,8 @@ const MAX_LEDGER_LIMIT = 200;
 @Controller('wallets')
 @UseGuards(AuthGuard)
 export class WalletsController {
+  private readonly logger = new Logger(WalletsController.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly metrics: MetricsService,
@@ -67,6 +69,17 @@ export class WalletsController {
 
   @Post(':walletId/reconciliation')
   async reconcile(@Param('walletId') walletId: string) {
-    return this.dataSource.transaction((manager) => reconcileWallet(manager, walletId));
+    const result = await this.dataSource.transaction((manager) => reconcileWallet(manager, walletId));
+    // "Divergências não são corrigidas silenciosamente: devem ser logadas,
+    // contabilizadas em métrica e sinalizadas na resposta" (seção 9). A resposta
+    // já sinaliza via `consistent`/`difference`; aqui garantimos as outras duas.
+    if (!result.consistent) {
+      this.metrics.reconciliationDivergencesTotal.inc();
+      // Nunca logamos os valores monetários em si (política de logs da seção 12) —
+      // só o fato de que houve divergência e quantos lançamentos foram conferidos,
+      // o suficiente para acionar uma investigação sem expor saldo real no log.
+      this.logger.error({ event: 'wallet_reconciliation_divergence', walletId, checkedEntries: result.checkedEntries });
+    }
+    return result;
   }
 }

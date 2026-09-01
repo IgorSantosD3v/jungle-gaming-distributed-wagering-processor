@@ -2,9 +2,13 @@ import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { AppModule } from './app.module';
+import { StructuredLogger } from './infra/observability/structured-logger';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, { logger: ['error', 'warn', 'log'] });
+  // Logger estruturado (JSON) — seção 12 do desafio. Registrado aqui, ele passa
+  // a valer para TODO `new Logger(contexto)` usado no projeto inteiro (controllers,
+  // workers, o próprio bootstrap do Nest), não só para chamadas explícitas.
+  const app = await NestFactory.create(AppModule, { logger: new StructuredLogger() });
 
   app.useGlobalPipes(
     new ValidationPipe({
