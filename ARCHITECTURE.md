@@ -217,6 +217,22 @@ fechar esse gap revelou dois bugs reais:
    `test/integration/consumer-crash-recovery.spec.ts`
    ("kind OPENING ... NEVER credits the wallet").
 
+3. **Mensagens da fila com campos malformados eram tratadas como erro
+   transitório, não permanente.** A seção 2 exige que mensagens da fila
+   passem pelas MESMAS validações de domínio que a API HTTP, mesmo sendo um
+   canal interno confiável. A API já garante isso via decorators do DTO
+   (`@IsUUID()` em `playerId`/`walletId`, por exemplo); a fila não tinha
+   equivalente — um `playerId` ou `walletId` que não fosse um UUID válido
+   chegava direto em `submitWagerTransaction`, o Postgres lançava um erro cru
+   de sintaxe ("invalid input syntax for type uuid") que não é um
+   `DomainError`, e a mensagem era classificada como `retry` (transitório)
+   quando na verdade é um erro permanente — ficaria tentando de novo à toa em
+   vez de ir direto para `dead_letter`. Corrigido com `validateEnvelopeData()`
+   em `process-incoming-message.ts`, que valida presença e formato de todos os
+   campos obrigatórios (incluindo UUID de `playerId`/`walletId`) antes de
+   qualquer chamada ao banco. Testado com `walletId`/`playerId` malformados e
+   com `providerId` ausente.
+
 ## 7. Referências fora de ordem (seção 7.1)
 
 Quando REFUND/ROLLBACK chega antes da transação que referencia, a transação fica

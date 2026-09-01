@@ -70,6 +70,35 @@ const SUBMITTABLE_KINDS: ReadonlySet<string> = new Set([
   WagerTransactionKind.Rollback,
 ]);
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * A seção 2 exige que mensagens da fila passem pelas MESMAS validações de
+ * domínio que a entrada HTTP, mesmo sendo um canal interno confiável — a API
+ * já garante isso via decorators do DTO (`@IsUUID()`, `@IsString()` etc.);
+ * este é o equivalente para a fila. Sem isso, um `playerId`/`walletId`
+ * malformado (não-UUID) chegaria direto em `submitWagerTransaction`, o
+ * Postgres lançaria um erro cru de sintaxe ("invalid input syntax for type
+ * uuid") que NÃO é um `DomainError`, e a mensagem seria classificada como
+ * `retry` (transitório) quando na verdade é um erro permanente — ficaria
+ * tentando de novo à toa em vez de ir direto para `dead_letter`.
+ */
+function validateEnvelopeData(data: WagerTransactionRequestedEnvelope['data'] | undefined): string | undefined {
+  if (!data || typeof data !== 'object') return 'data is missing or not an object';
+  if (!data.providerId || typeof data.providerId !== 'string') return 'providerId is missing or not a string';
+  if (!data.externalTransactionId || typeof data.externalTransactionId !== 'string') return 'externalTransactionId is missing or not a string';
+  if (!data.idempotencyKey || typeof data.idempotencyKey !== 'string') return 'idempotencyKey is missing or not a string';
+  if (!data.playerId || !UUID_PATTERN.test(data.playerId)) return 'playerId is missing or not a valid UUID';
+  if (!data.walletId || !UUID_PATTERN.test(data.walletId)) return 'walletId is missing or not a valid UUID';
+  if (!data.roundId || typeof data.roundId !== 'string') return 'roundId is missing or not a string';
+  if (!data.gameId || typeof data.gameId !== 'string') return 'gameId is missing or not a string';
+  if (!data.money || typeof data.money.amount !== 'string' || typeof data.money.currency !== 'string') return 'money is missing or malformed';
+  if (data.referenceExternalTransactionId !== undefined && typeof data.referenceExternalTransactionId !== 'string') {
+    return 'referenceExternalTransactionId must be a string when present';
+  }
+  return undefined;
+}
+
 export async function processIncomingMessage(
   dataSource: DataSource,
   metrics: MetricsService,
@@ -97,6 +126,15 @@ export async function processIncomingMessage(
     return {
       action: 'dead_letter',
       reason: `invalid_or_internal_kind: "${envelope.data?.kind}" is not a submittable WagerTransactionKind`,
+      context: { correlationId: envelope.messageId, providerId: envelope.data?.providerId, walletId: envelope.data?.walletId },
+    };
+  }
+
+  const validationError = validateEnvelopeData(envelope.data);
+  if (validationError) {
+    return {
+      action: 'dead_letter',
+      reason: `invalid_envelope_data: ${validationError}`,
       context: { correlationId: envelope.messageId, providerId: envelope.data?.providerId, walletId: envelope.data?.walletId },
     };
   }

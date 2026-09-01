@@ -184,4 +184,78 @@ describe('Consumer: malformed payload goes straight to dead_letter, never to ret
     const outcome = await processIncomingMessage(dataSource, metrics, WAGER_TRANSACTIONS_CONSUMER_NAME, body);
     expect(outcome.action).toBe('dead_letter');
   });
+
+  it('a message with a non-UUID walletId goes to dead_letter, not retry (seção 2: fila sujeita às mesmas validações de domínio)', async () => {
+    const wallet = await openWallet('100.00');
+    const metrics = new MetricsService();
+    const body = JSON.stringify({
+      messageId: 'msg-bad-wallet-id',
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'provider-a',
+        externalTransactionId: 'bad-wallet-1',
+        idempotencyKey: 'provider-a:bad-wallet-1',
+        playerId: wallet.playerId,
+        walletId: 'not-a-real-uuid',
+        roundId: 'r1',
+        gameId: 'g1',
+        kind: 'BET',
+        money: { amount: '5.00', currency: 'BRL' },
+      },
+    });
+
+    const outcome = await processIncomingMessage(dataSource, metrics, WAGER_TRANSACTIONS_CONSUMER_NAME, body);
+    // Sem a validação explícita, isso estouraria como um erro cru do Postgres
+    // ("invalid input syntax for type uuid") e cairia em "retry" por engano —
+    // um erro permanente sendo tratado como transitório.
+    expect(outcome.action).toBe('dead_letter');
+  });
+
+  it('a message with a non-UUID playerId also goes to dead_letter', async () => {
+    const wallet = await openWallet('100.00');
+    const metrics = new MetricsService();
+    const body = JSON.stringify({
+      messageId: 'msg-bad-player-id',
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'provider-a',
+        externalTransactionId: 'bad-player-1',
+        idempotencyKey: 'provider-a:bad-player-1',
+        playerId: 'also-not-a-uuid',
+        walletId: wallet.id,
+        roundId: 'r1',
+        gameId: 'g1',
+        kind: 'BET',
+        money: { amount: '5.00', currency: 'BRL' },
+      },
+    });
+
+    const outcome = await processIncomingMessage(dataSource, metrics, WAGER_TRANSACTIONS_CONSUMER_NAME, body);
+    expect(outcome.action).toBe('dead_letter');
+  });
+
+  it('a message missing providerId goes to dead_letter', async () => {
+    const wallet = await openWallet('100.00');
+    const metrics = new MetricsService();
+    const body = JSON.stringify({
+      messageId: 'msg-missing-provider',
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        externalTransactionId: 'no-provider-1',
+        idempotencyKey: 'provider-a:no-provider-1',
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: 'r1',
+        gameId: 'g1',
+        kind: 'BET',
+        money: { amount: '5.00', currency: 'BRL' },
+      },
+    });
+
+    const outcome = await processIncomingMessage(dataSource, metrics, WAGER_TRANSACTIONS_CONSUMER_NAME, body);
+    expect(outcome.action).toBe('dead_letter');
+  });
 });
