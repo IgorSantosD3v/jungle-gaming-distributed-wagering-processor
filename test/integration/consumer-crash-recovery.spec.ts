@@ -133,4 +133,55 @@ describe('Consumer: malformed payload goes straight to dead_letter, never to ret
     const outcome = await processIncomingMessage(dataSource, metrics, WAGER_TRANSACTIONS_CONSUMER_NAME, JSON.stringify({ foo: 'bar' }));
     expect(outcome.action).toBe('dead_letter');
   });
+
+  it('a message with kind "OPENING" is dead-lettered and NEVER credits the wallet (OPENING is internal-only, seção 6.3)', async () => {
+    const wallet = await openWallet('100.00');
+    const metrics = new MetricsService();
+    const maliciousBody = JSON.stringify({
+      messageId: 'msg-opening-attack',
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'provider-a',
+        externalTransactionId: 'free-money-1',
+        idempotencyKey: 'provider-a:free-money-1',
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: 'r1',
+        gameId: 'g1',
+        kind: 'OPENING',
+        money: { amount: '999999.00', currency: 'BRL' },
+      },
+    });
+
+    const outcome = await processIncomingMessage(dataSource, metrics, WAGER_TRANSACTIONS_CONSUMER_NAME, maliciousBody);
+    expect(outcome.action).toBe('dead_letter');
+
+    const walletRow = await dataSource.getRepository(WalletEntity).findOneByOrFail({ id: wallet.id });
+    expect(walletRow.balance).toBe('100.00'); // inalterado — nenhum crédito indevido
+  });
+
+  it('a message with a bogus kind string is also dead-lettered', async () => {
+    const wallet = await openWallet('100.00');
+    const metrics = new MetricsService();
+    const body = JSON.stringify({
+      messageId: 'msg-bogus-kind',
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'provider-a',
+        externalTransactionId: 'bogus-1',
+        idempotencyKey: 'provider-a:bogus-1',
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: 'r1',
+        gameId: 'g1',
+        kind: 'NOT_A_REAL_KIND',
+        money: { amount: '5.00', currency: 'BRL' },
+      },
+    });
+
+    const outcome = await processIncomingMessage(dataSource, metrics, WAGER_TRANSACTIONS_CONSUMER_NAME, body);
+    expect(outcome.action).toBe('dead_letter');
+  });
 });

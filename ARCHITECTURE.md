@@ -188,6 +188,35 @@ instância (ou a mesma, ao reiniciar) simplesmente encontra a linha ainda com
 confirmar o envio e o `UPDATE` marcar `published_at`) é seguro porque o consumidor é
 idempotente (idempotency_key + inbox).
 
+## 6.1 Bugs reais encontrados na revisão final deste projeto
+
+Até uma revisão final, o caminho de código que resolve referências (REFUND,
+ROLLBACK, e o WIN opcional) nunca tinha sido exercitado de ponta a ponta por
+um teste — só o caminho "referência ainda não existe" (`PENDING_REFERENCE`)
+tinha cobertura. Escrever `test/integration/business-rules.spec.ts` para
+fechar esse gap revelou dois bugs reais:
+
+1. **Checagem de valor aplicada ao WIN por engano.** A regra "o valor deve
+   ser igual ao valor da referência" (seção 7) é só para REFUND/ROLLBACK, mas
+   estava sendo aplicada a qualquer transação com referência, inclusive WIN —
+   que normalmente tem um valor diferente da BET que referencia (o prêmio
+   quase nunca é igual ao valor apostado). Corrigido restringindo a exigência
+   a `kind === REFUND || kind === ROLLBACK`.
+
+2. **O consumidor SQS não validava o `kind` da mensagem.** A API já bloqueava
+   `OPENING` via `@IsEnum` no DTO, mas `processIncomingMessage` (o caminho da
+   fila) aceitava qualquer string em `data.kind` sem checagem. Uma mensagem
+   com `"kind": "OPENING"` chegaria em `submitWagerTransaction` e, por não
+   ser `"BET"`, cairia no branch de `credit()` em `applyDirectMutation` —
+   creditando a wallet sem nenhum débito correspondente, uma violação direta
+   de "OPENING é interno: não pode ser submetido pela API nem pela fila"
+   (seção 6.3). Corrigido com uma validação explícita logo no início de
+   `processIncomingMessage`: qualquer `kind` fora de
+   `{BET, WIN, LOSS, REFUND, ROLLBACK}` — incluindo `OPENING` — vai direto
+   para `dead_letter`, sem tocar no banco. Testado em
+   `test/integration/consumer-crash-recovery.spec.ts`
+   ("kind OPENING ... NEVER credits the wallet").
+
 ## 7. Referências fora de ordem (seção 7.1)
 
 Quando REFUND/ROLLBACK chega antes da transação que referencia, a transação fica
@@ -323,10 +352,17 @@ separados de liveness/readiness.
 
 ## 12. Testes que fecham cenários específicos da seção 13
 
-Além dos arquivos já descritos no README, três specs cobrem cenários exigidos
+Além dos arquivos já descritos no README, quatro specs cobrem cenários exigidos
 pela seção 13 que exigiram extrair lógica de negócio para funções puras
 testáveis, fora dos workers do NestJS:
 
+- `test/integration/business-rules.spec.ts` — a tabela de regras de negócio da
+  seção 7 (BET/WIN/LOSS/REFUND/ROLLBACK) de ponta a ponta contra Postgres real:
+  o caminho feliz de cada operação, as rejeições esperadas (referência do tipo
+  errado, valor divergente, reversão duplicada, escopo diferente,
+  `REVERSAL_WOULD_OVERDRAW`), e a invariante final
+  `wallet.balance == saldo reconstruído pelo ledger` depois de uma mistura de
+  operações. Foi escrevendo este arquivo que o bug do §6.1 foi encontrado.
 - `test/integration/consumer-crash-recovery.spec.ts` — "worker morto depois do
   commit e antes do ack", testado chamando `processIncomingMessage` duas vezes
   com o mesmo corpo de mensagem (simula a redelivery que o SQS faria de

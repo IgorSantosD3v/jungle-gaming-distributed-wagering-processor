@@ -260,7 +260,12 @@ async function handleReferencedTransaction(
     return toResult(tx, wallet.balance, false);
   }
 
-  if (!tx.money.equals(reference.money)) {
+  // "O valor de REFUND/ROLLBACK deve ser igual ao valor da referência" (seção 7) —
+  // essa regra é só para REFUND/ROLLBACK. WIN pode referenciar uma BET
+  // opcionalmente, mas o valor do prêmio normalmente é DIFERENTE do valor
+  // apostado (por isso não faz sentido exigir igualdade aqui).
+  const requiresEqualAmount = tx.kind === WagerTransactionKind.Refund || tx.kind === WagerTransactionKind.Rollback;
+  if (requiresEqualAmount && !tx.money.equals(reference.money)) {
     tx.reject(FailureCode.AMOUNT_MISMATCH_WITH_REFERENCE);
     await persistRejection(manager, tx, command.correlationId);
     return toResult(tx, wallet.balance, false);

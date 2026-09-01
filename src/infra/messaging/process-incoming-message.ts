@@ -61,6 +61,15 @@ export type MessageProcessingOutcome =
  * verdade; esta função é pura o suficiente para ser testada diretamente contra
  * um Postgres real, sem precisar de LocalStack.
  */
+/** OPENING é interno — nunca aceito vindo de fora, seja API ou fila (seção 6.3). */
+const SUBMITTABLE_KINDS: ReadonlySet<string> = new Set([
+  WagerTransactionKind.Bet,
+  WagerTransactionKind.Win,
+  WagerTransactionKind.Loss,
+  WagerTransactionKind.Refund,
+  WagerTransactionKind.Rollback,
+]);
+
 export async function processIncomingMessage(
   dataSource: DataSource,
   metrics: MetricsService,
@@ -77,6 +86,19 @@ export async function processIncomingMessage(
   } catch (err) {
     // Payload permanentemente inválido — nenhuma quantidade de retry resolve isso.
     return { action: 'dead_letter', reason: `malformed_payload: ${(err as Error).message}` };
+  }
+
+  // Validação explícita do `kind` — sem isso, uma mensagem com "kind": "OPENING"
+  // (ou qualquer string arbitrária) chegaria direto em `submitWagerTransaction` e,
+  // por não ser "BET", cairia no branch de CREDIT em `applyDirectMutation`,
+  // creditando a wallet sem nenhum débito correspondente. A API já bloqueia isso
+  // via DTO (`@IsEnum`); a fila precisa da mesma barreira.
+  if (!SUBMITTABLE_KINDS.has(envelope.data?.kind as string)) {
+    return {
+      action: 'dead_letter',
+      reason: `invalid_or_internal_kind: "${envelope.data?.kind}" is not a submittable WagerTransactionKind`,
+      context: { correlationId: envelope.messageId, providerId: envelope.data?.providerId, walletId: envelope.data?.walletId },
+    };
   }
 
   const context: MessageLogContext = {
