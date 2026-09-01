@@ -1,18 +1,10 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { DataSource } from 'typeorm';
-import {
-  ChangeMessageVisibilityCommand,
-  DeleteMessageCommand,
-  ReceiveMessageCommand,
-  SendMessageCommand,
-  SQSClient,
-} from '@aws-sdk/client-sqs';
+import { ReceiveMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import type { Message } from '@aws-sdk/client-sqs';
 import { MetricsService } from '../observability/metrics.service';
 import { processIncomingMessage, WAGER_TRANSACTIONS_CONSUMER_NAME } from './process-incoming-message';
-
-const MAX_BACKOFF_SECONDS = 60;
-const BASE_BACKOFF_SECONDS = 5;
+import { applyMessageOutcome } from './apply-message-outcome';
 
 /**
  * Consome `wager-transactions.fifo`. Regras cumpridas aqui (seção 10):
@@ -21,10 +13,9 @@ const BASE_BACKOFF_SECONDS = 5;
  *  - ack (delete da fila) só depois do commit;
  *  - distingue TRÊS categorias, explicitamente, não duas: erro de negócio (ack — o
  *    resultado já foi persistido), erro transitório (retry com backoff real via
- *    ChangeMessageVisibility, não apenas "esperar o timeout fixo passar"), e erro
- *    permanente (DLQ imediata, publicada pelo próprio código — não esperamos o
- *    maxReceiveCount do SQS esgotar sozinho para um payload que sabemos, de cara,
- *    que nunca vai processar);
+ *    ChangeMessageVisibility) e erro permanente (DLQ imediata) — ver
+ *    apply-message-outcome.ts, que executa os efeitos reais no SQS e é testado
+ *    isoladamente contra um LocalStack real;
  *  - SIGTERM: para de puxar novas mensagens e aguarda as em andamento (ver onModuleDestroy).
  */
 @Injectable()
@@ -93,65 +84,7 @@ export class WagerTransactionsConsumer implements OnModuleInit, OnModuleDestroy 
 
       const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? '1');
       const outcome = await processIncomingMessage(this.dataSource, this.metrics, WAGER_TRANSACTIONS_CONSUMER_NAME, message.Body);
-
-      switch (outcome.action) {
-        case 'ack': {
-          this.logger.log({
-            event: outcome.note ? 'message_ack_business_terminal' : 'message_ack_processed',
-            messageId: message.MessageId,
-            ...outcome.context,
-            note: outcome.note,
-          });
-          if (message.ReceiptHandle) {
-            await this.sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }));
-          }
-          break;
-        }
-        case 'retry': {
-          this.metrics.sqsRedeliveriesTotal.inc();
-          const backoffSeconds = Math.min(BASE_BACKOFF_SECONDS * 2 ** receiveCount, MAX_BACKOFF_SECONDS);
-          this.logger.warn({
-            event: 'message_retry_scheduled',
-            messageId: message.MessageId,
-            reason: outcome.reason,
-            receiveCount,
-            backoffSeconds,
-            ...outcome.context,
-          });
-          // Backoff real: em vez de deixar a mensagem reaparecer só depois do
-          // VisibilityTimeout fixo da fila (30s sempre), estendemos a visibilidade
-          // com um valor que cresce a cada tentativa — a próxima reentrega demora
-          // mais quanto mais vezes já falhou.
-          if (message.ReceiptHandle) {
-            await this.sqs.send(
-              new ChangeMessageVisibilityCommand({
-                QueueUrl: queueUrl,
-                ReceiptHandle: message.ReceiptHandle,
-                VisibilityTimeout: backoffSeconds,
-              }),
-            );
-          }
-          break;
-        }
-        case 'dead_letter': {
-          this.logger.error({ event: 'message_dead_lettered', messageId: message.MessageId, reason: outcome.reason, ...outcome.context });
-          const dlqUrl = process.env.SQS_DLQ_URL;
-          if (dlqUrl) {
-            await this.sqs.send(
-              new SendMessageCommand({
-                QueueUrl: dlqUrl,
-                MessageBody: message.Body,
-                MessageGroupId: 'dead-lettered-by-consumer',
-                MessageDeduplicationId: message.MessageId,
-              }),
-            );
-          }
-          if (message.ReceiptHandle) {
-            await this.sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }));
-          }
-          break;
-        }
-      }
+      await applyMessageOutcome(this.sqs, queueUrl, process.env.SQS_DLQ_URL, message, outcome, receiveCount, this.metrics, this.logger);
     } finally {
       this.inFlight -= 1;
     }

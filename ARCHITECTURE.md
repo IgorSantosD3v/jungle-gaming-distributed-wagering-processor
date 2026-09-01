@@ -363,6 +363,15 @@ testáveis, fora dos workers do NestJS:
   `REVERSAL_WOULD_OVERDRAW`), e a invariante final
   `wallet.balance == saldo reconstruído pelo ledger` depois de uma mistura de
   operações. Foi escrevendo este arquivo que o bug do §6.1 foi encontrado.
+- `test/integration/consumer-sqs-outcomes.spec.ts` — os efeitos REAIS no SQS
+  das três categorias de erro (§7.1): `applyMessageOutcome` (extraída de
+  `WagerTransactionsConsumer.handle()`) é chamada contra um LocalStack real e o
+  teste confirma, olhando as filas de verdade, que `ack` deleta da fila
+  principal, `dead_letter` publica na DLQ E deleta da principal, e `retry`
+  nunca deleta nem manda nada para a DLQ. Até este teste ser escrito, o código
+  que decide entre essas três ações nunca tinha sido executado nem uma vez
+  contra infraestrutura real — só a função de decisão (`processIncomingMessage`)
+  tinha cobertura, não a de execução.
 - `test/integration/consumer-crash-recovery.spec.ts` — "worker morto depois do
   commit e antes do ack", testado chamando `processIncomingMessage` duas vezes
   com o mesmo corpo de mensagem (simula a redelivery que o SQS faria de
