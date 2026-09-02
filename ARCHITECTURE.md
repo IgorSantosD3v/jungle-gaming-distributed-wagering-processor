@@ -5,7 +5,7 @@
 **Decisão: não implementada.** O guard (`AuthGuard`) é um no-op explícito e documentado
 em `src/common/auth/auth.guard.ts`. Motivo: autenticação não vale pontos na tabela da
 seção 14 e o timebox de 3 dias foi priorizado inteiramente para correção financeira,
-concorrência e idempotência — que somam 55 dos 100 pontos e têm falhas eliminatórias.
+concorrência e idempotência, que somam 55 dos 100 pontos e têm falhas eliminatórias.
 
 Desenho que seria adotado em produção: Keycloak como Identity Provider, cada game
 provider como um client OIDC com `client_credentials` grant, escopo `wagering:write`
@@ -22,31 +22,31 @@ uma transação SQL real, não optimistic locking com retry.**
 
 Por quê: a unidade de concorrência é a `walletId`. Com `FOR UPDATE`, a segunda
 transação que tentar tocar a mesma wallet simplesmente **espera** (bloqueia) até a
-primeira commitar ou dar rollback — não há corrida para perder, não há "lost update"
+primeira commitar ou dar rollback não há corrida para perder, não há "lost update"
 possível, e não precisa de lógica de retry com backoff no caminho crítico (que optimistic
 locking exigiria). O custo é serialização por wallet (uma wallet "quente" processa uma
 transação de cada vez), o que é aceitável porque **wallets diferentes continuam
-paralelas** (locks são por linha, não globais — a restrição "não usar lock global
+paralelas** (locks são por linha, não globais a restrição "não usar lock global
 compartilhado por todas as wallets" da seção 5 é respeitada).
 
 O campo `wallet.version` continua existindo e é incrementado no aggregate a cada
-mudança de saldo, mas é **auditoria/API**, não o mecanismo de concorrência em si —
+mudança de saldo, mas é **auditoria/API**, não o mecanismo de concorrência em si
 por isso não é um `@VersionColumn` do TypeORM (que implementaria optimistic locking
 automático, que não é a estratégia escolhida).
 
 **Decisão explícita:** o crédito de abertura (`initialBalance` em `POST /wallets`)
-**não** conta como uma mutação para efeito de `version` — a wallet nasce
+**não** conta como uma mutação para efeito de `version` a wallet nasce
 diretamente com `version: 1` e o saldo já aplicado, em vez de "nascer em zero e
 depois ser creditada" (o que bateria a version para 2). Isso segue o próprio
 exemplo de resposta do desafio (seção 9), que mostra `"version": 1` mesmo com
 `initialBalance` de `1000.00`. A transação `OPENING` e o lançamento de ledger
 correspondente (`balanceBefore: 0.00 -> balanceAfter: <saldo inicial>`) continuam
-gravados normalmente para auditoria — só a `version` do aggregate não conta essa
+gravados normalmente para auditoria só a `version` do aggregate não conta essa
 abertura como uma mutação separada.
 
 Idempotência de negócio (a mesma `idempotency_key` nunca cria duas linhas) usa
 `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` (não uma constraint `UNIQUE`
-"crua" capturada via exceção — ver §2.1 abaixo, por quê). Uma colisão simplesmente
+"crua" capturada via exceção ver §2.1 abaixo, por quê). Uma colisão simplesmente
 não insere nada, sem lançar erro; checamos se o `INSERT` afetou alguma linha para
 saber se "ganhamos" o direito de processar ou se é um replay. Isso é o que garante
 que "a mesma aposta enviada 50 vezes em paralelo" produz um único débito mesmo com
@@ -68,14 +68,14 @@ enquanto a FK aponta pra ela.
 
 Sob concorrência real na mesma wallet, isso produzia um deadlock clássico: duas
 transações pegavam esse lock de leitura implícito ao mesmo tempo (compatível entre
-si — locks de leitura não conflitam), e depois cada uma tentava adquirir o lock
+si locks de leitura não conflitam), e depois cada uma tentava adquirir o lock
 exclusivo (`FOR UPDATE`) explícito, esperando a outra soltar o lock de leitura
-primeiro. As duas ficavam esperando uma pela outra — o Postgres detectou
+primeiro. As duas ficavam esperando uma pela outra o Postgres detectou
 (`error: deadlock detected`, code `40P01`) e abortou uma delas.
 
 Um segundo problema, relacionado: quando o `INSERT` batia numa `idempotency_key`
 duplicada (uma constraint `UNIQUE` "crua"), o Postgres lançava um erro real, o que
-marca a transação inteira como abortada no lado do banco — qualquer `SELECT`
+marca a transação inteira como abortada no lado do banco qualquer `SELECT`
 seguinte na mesma transação falhava com `current transaction is aborted` (code
 `25P02`), mesmo com o erro original já "tratado" no `catch` do JavaScript.
 
@@ -86,7 +86,7 @@ possibilidade de deadlock por definição; (2) trocar o `INSERT` capturado via
 try/catch por `INSERT ... ON CONFLICT DO NOTHING`, que nunca lança um erro real do
 banco para o caso esperado de colisão de idempotência. Essa combinação foi
 encontrada e corrigida rodando `test/concurrency` de verdade contra um PostgreSQL
-real — é exatamente o tipo de bug que testes com mock de banco nunca pegariam, e é
+real é exatamente o tipo de bug que testes com mock de banco nunca pegariam, e é
 parte do motivo pelo qual o desafio proíbe isso como falha eliminatória.
 
 Um terceiro problema apareceu na primeira tentativa de correção: o `INSERT ...
@@ -109,16 +109,16 @@ ambiguidade nenhuma.
 
 Duas camadas independentes, cada uma resolvendo um problema diferente:
 
-1. **Idempotência de negócio** — `UNIQUE(idempotency_key)` em `wager_transactions`,
-   aplicada via `INSERT ... ON CONFLICT DO NOTHING` (ver §2.1 — nunca via exceção
+1. **Idempotência de negócio**  `UNIQUE(idempotency_key)` em `wager_transactions`,
+   aplicada via `INSERT ... ON CONFLICT DO NOTHING` (ver §2.1 nunca via exceção
    capturada de uma violação de constraint crua). Fonte da verdade: o header
    `Idempotency-Key`. `payloadHash` é um SHA-256 de um JSON canônico (chaves
-   ordenadas) do subconjunto de campos de negócio — nunca do header nem de
+   ordenadas) do subconjunto de campos de negócio nunca do header nem de
    metadados de transporte (ver `src/common/idempotency/payload-hash.ts`). Mesma
    key + mesmo hash = replay (`idempotentReplay: true`, mesmo resultado). Mesma
    key + hash diferente = conflito (409), nunca tratado como replay.
 
-2. **Deduplicação de transporte** — `UNIQUE(consumer_name, message_id)` em
+2. **Deduplicação de transporte** `UNIQUE(consumer_name, message_id)` em
    `inbox_messages`. Resolve um problema diferente: o SQS pode entregar a **mesma
    mensagem física** mais de uma vez (at-least-once) mesmo que o conteúdo de negócio
    seja idêntico. O inbox garante que o *efeito de processar aquela entrega específica*
@@ -127,16 +127,16 @@ Duas camadas independentes, cada uma resolvendo um problema diferente:
 
 Repetir uma operação já `PROCESSED` retorna o saldo **observado no momento original**
 (lido do `balanceAfter` do lançamento de ledger daquela transação), não o saldo atual
-da wallet — que pode ter mudado por outras transações desde então. Para transações que
+da wallet que pode ter mudado por outras transações desde então. Para transações que
 nunca afetaram o saldo (`LOSS`, `REJECTED`, `PENDING_REFERENCE`), não há lançamento
 histórico para consultar; como essas nunca moveram o saldo, o saldo atual da wallet é
-usado como equivalente — uma simplificação documentada aqui, não escondida.
+usado como equivalente uma simplificação documentada aqui, não escondida.
 
 ## 4. Money e precisão
 
 `Money` (`src/domain/money/money.ts`) nunca usa `number`/`float`/`double`. Internamente
 usa `Decimal` (decimal.js); externamente, sempre string decimal com escala fixa de 2
-casas. Persistido em colunas `NUMERIC(18,2)` — nunca `FLOAT`/`DOUBLE PRECISION`.
+casas. Persistido em colunas `NUMERIC(18,2)` nunca `FLOAT`/`DOUBLE PRECISION`.
 
 Entradas de contrato (HTTP/fila) são **mais estritas** que o Value Object: o DTO
 (`MoneyDto`) rejeita valores negativos (a direção do movimento vem do `kind`, não do
@@ -162,7 +162,7 @@ camada de infraestrutura.
 
 Escrita do evento na tabela `outbox_messages` acontece **na mesma transação SQL** que
 a mutação financeira (`src/infra/messaging/outbox-writer.ts`, chamado de dentro do
-`EntityManager` da transação do caso de uso) — nunca há uma janela em que o saldo já
+`EntityManager` da transação do caso de uso) nunca há uma janela em que o saldo já
 mudou mas o evento "não existe ainda" de forma durável.
 
 **Fila de saída separada da fila de entrada.** `WagerTransactionsConsumer` escuta
@@ -172,12 +172,12 @@ provedores. `OutboxPublisherWorker` publica os eventos de domínio
 `WagerTransactionPendingReference`) numa fila **diferente**, `wager-events.fifo`
 (`SQS_EVENTS_QUEUE_URL`). Isso não é incidental: publicar e consumir na mesma fila
 criaria um loop em que os próprios eventos de saída do sistema seriam recebidos de
-volta pelo consumidor como se fossem novos pedidos de aposta — um bug real que
+volta pelo consumidor como se fossem novos pedidos de aposta um bug real que
 apareceu durante os testes manuais deste projeto (o consumidor tentava extrair um
 `messageId` de um envelope de evento, que não tem esse campo, e violava a
 constraint `NOT NULL` de `inbox_messages`). `wager-events.fifo` existe para quem
 quiser assinar as notificações do sistema (ex.: um serviço de relatórios ou
-auditoria) — nenhum componente deste próprio serviço a consome.
+auditoria) nenhum componente deste próprio serviço a consome.
 
 O `OutboxPublisherWorker` roda em loop, pega lotes com
 `SELECT ... FOR UPDATE SKIP LOCKED` (permite múltiplos publishers/instâncias
@@ -192,13 +192,13 @@ idempotente (idempotency_key + inbox).
 
 Até uma revisão final, o caminho de código que resolve referências (REFUND,
 ROLLBACK, e o WIN opcional) nunca tinha sido exercitado de ponta a ponta por
-um teste — só o caminho "referência ainda não existe" (`PENDING_REFERENCE`)
+um teste só o caminho "referência ainda não existe" (`PENDING_REFERENCE`)
 tinha cobertura. Escrever `test/integration/business-rules.spec.ts` para
 fechar esse gap revelou dois bugs reais:
 
 1. **Checagem de valor aplicada ao WIN por engano.** A regra "o valor deve
    ser igual ao valor da referência" (seção 7) é só para REFUND/ROLLBACK, mas
-   estava sendo aplicada a qualquer transação com referência, inclusive WIN —
+   estava sendo aplicada a qualquer transação com referência, inclusive WIN
    que normalmente tem um valor diferente da BET que referencia (o prêmio
    quase nunca é igual ao valor apostado). Corrigido restringindo a exigência
    a `kind === REFUND || kind === ROLLBACK`.
@@ -207,12 +207,12 @@ fechar esse gap revelou dois bugs reais:
    `OPENING` via `@IsEnum` no DTO, mas `processIncomingMessage` (o caminho da
    fila) aceitava qualquer string em `data.kind` sem checagem. Uma mensagem
    com `"kind": "OPENING"` chegaria em `submitWagerTransaction` e, por não
-   ser `"BET"`, cairia no branch de `credit()` em `applyDirectMutation` —
+   ser `"BET"`, cairia no branch de `credit()` em `applyDirectMutation`
    creditando a wallet sem nenhum débito correspondente, uma violação direta
    de "OPENING é interno: não pode ser submetido pela API nem pela fila"
    (seção 6.3). Corrigido com uma validação explícita logo no início de
    `processIncomingMessage`: qualquer `kind` fora de
-   `{BET, WIN, LOSS, REFUND, ROLLBACK}` — incluindo `OPENING` — vai direto
+   `{BET, WIN, LOSS, REFUND, ROLLBACK}` incluindo `OPENING` vai direto
    para `dead_letter`, sem tocar no banco. Testado em
    `test/integration/consumer-crash-recovery.spec.ts`
    ("kind OPENING ... NEVER credits the wallet").
@@ -222,7 +222,7 @@ fechar esse gap revelou dois bugs reais:
    passem pelas MESMAS validações de domínio que a API HTTP, mesmo sendo um
    canal interno confiável. A API já garante isso via decorators do DTO
    (`@IsUUID()` em `playerId`/`walletId`, por exemplo); a fila não tinha
-   equivalente — um `playerId` ou `walletId` que não fosse um UUID válido
+   equivalente um `playerId` ou `walletId` que não fosse um UUID válido
    chegava direto em `submitWagerTransaction`, o Postgres lançava um erro cru
    de sintaxe ("invalid input syntax for type uuid") que não é um
    `DomainError`, e a mensagem era classificada como `retry` (transitório)
@@ -236,11 +236,11 @@ fechar esse gap revelou dois bugs reais:
 4. **`GET /wallets/:id/ledger` não checava se a wallet existia.**
    `GET /wallets/:id` corretamente devolve 404 para uma wallet inexistente,
    mas `GET /wallets/:id/ledger` simplesmente consultava a tabela de ledger
-   filtrando por `wallet_id` — para uma wallet que nunca existiu, isso
+   filtrando por `wallet_id` para uma wallet que nunca existiu, isso
    silenciosamente retornava `200` com uma lista vazia, em vez de `404`. Mesmo
    recurso (a wallet), dois endpoints com comportamentos inconsistentes para
    o mesmo caso de erro. Corrigido adicionando uma checagem de existência no
-   início de `getWalletLedger()`, antes de consultar o ledger — agora lança o
+   início de `getWalletLedger()`, antes de consultar o ledger agora lança o
    mesmo `WalletNotFoundError` que `getWallet()` já lançava. Testado em
    `test/integration/persistence.spec.ts`.
 
@@ -249,7 +249,7 @@ fechar esse gap revelou dois bugs reais:
 Quando REFUND/ROLLBACK chega antes da transação que referencia, a transação fica
 `PENDING_REFERENCE` e nenhuma mutação de saldo acontece. O `PendingReferenceWorker`
 reprocessa periodicamente (backoff exponencial, base 3s, teto 120s), reutilizando o
-mesmo `submitWagerTransaction` usado pela API/fila — não existe um caminho de código
+mesmo `submitWagerTransaction` usado pela API/fila não existe um caminho de código
 separado e potencialmente divergente para "resolver referência tardia".
 
 **Limite de tentativas: 8** (constante `MAX_REFERENCE_ATTEMPTS`). Com backoff
@@ -271,7 +271,7 @@ correspondente:
 |---|---|---|
 | `ack` | Erro de negócio (terminal, ex.: `IdempotencyConflictError`) ou sucesso | `DeleteMessage` — o resultado já está persistido, reenviar não muda nada |
 | `retry` | Falha transitória (Postgres fora do ar, timeout de lock, deadlock) | `ChangeMessageVisibility` com backoff real: `5 * 2^tentativa` segundos, capado em 60s — não apenas "esperar o VisibilityTimeout fixo de 30s passar sempre" |
-| `dead_letter` | Erro permanente — JSON inválido, campos obrigatórios ausentes | `SendMessage` direto para `SQS_DLQ_URL` + `DeleteMessage` da fila principal — **imediato**, não esperamos o `maxReceiveCount` do SQS esgotar sozinho para um payload que já sabemos, de cara, que nunca vai processar |
+| `dead_letter` | Erro permanente JSON inválido, campos obrigatórios ausentes | `SendMessage` direto para `SQS_DLQ_URL` + `DeleteMessage` da fila principal **imediato**, não esperamos o `maxReceiveCount` do SQS esgotar sozinho para um payload que já sabemos, de cara, que nunca vai processar |
 
 Essa terceira via (dead-letter imediata pelo próprio código) é uma mudança
 deliberada em relação a uma versão anterior deste projeto, que deixava até
@@ -279,12 +279,12 @@ payloads malformados serem redescobertos e reentregues pelo SQS até o
 `maxReceiveCount` (5 tentativas, ~2-3 minutos) esgotar sozinho antes de cair na
 DLQ via redrive policy. Isso ainda funciona como rede de segurança (a redrive
 policy continua configurada em `docker/localstack-init.sh`), mas agora é a
-exceção, não o caminho principal — mensagens que sabemos ser irrecuperáveis são
+exceção, não o caminho principal mensagens que sabemos ser irrecuperáveis são
 identificadas e roteadas em milissegundos, não minutos.
 
 `processIncomingMessage` é o que torna testável, sem mocks de SQS, o cenário
 "worker morto depois do commit e antes do ack" (seção 13): chamar a função duas
-vezes com o EXATO mesmo corpo de mensagem simula precisamente uma redelivery —
+vezes com o EXATO mesmo corpo de mensagem simula precisamente uma redelivery
 ver `test/integration/consumer-crash-recovery.spec.ts`.
 
 ## 8. Taxonomia de failure codes
@@ -295,8 +295,8 @@ provedor decidir mecanicamente se deve reenviar. Dois códigos merecem destaque 
 serem exigidos explicitamente pelo desafio como **distintos** apesar de ambos serem
 "saldo insuficiente" na causa raiz:
 
-- `INSUFFICIENT_BALANCE` — uma aposta (BET) comum sem saldo.
-- `REVERSAL_WOULD_OVERDRAW` — uma reversão (ROLLBACK/REFUND) que deixaria o saldo
+- `INSUFFICIENT_BALANCE` uma aposta (BET) comum sem saldo.
+- `REVERSAL_WOULD_OVERDRAW` uma reversão (ROLLBACK/REFUND) que deixaria o saldo
   negativo. Operacionalmente diferente: geralmente indica que o jogador já gastou o
   dinheiro que estava sendo revertido em outra coisa, um cenário que o time de
   operações trata de forma distinta de uma aposta simplesmente recusada.
@@ -321,7 +321,7 @@ Ver `src/interfaces/http/domain-exception.filter.ts` e
 
 ## 10. Observabilidade
 
-**Logs estruturados (JSON)** — `StructuredLogger`
+**Logs estruturados (JSON)** `StructuredLogger`
 (`src/infra/observability/structured-logger.ts`), registrado como o logger da
 aplicação inteira em `main.ts`. Cada linha de log é um único objeto JSON, não
 texto livre; isso vale automaticamente para todo `new Logger(contexto)` usado em
@@ -330,12 +330,12 @@ qualquer arquivo, incluindo o próprio bootstrap do Nest. Nos pontos de negócio
 campos padronizados exigidos pela seção 12 quando fazem sentido para aquele
 evento: `correlationId`, `messageId` (via `context` do evento), `transactionId`,
 `walletId`, `providerId`. Nenhum log inclui o valor monetário em si nem o
-payload financeiro completo — `StructuredLogger` redige automaticamente chaves
+payload financeiro completo `StructuredLogger` redige automaticamente chaves
 como `money`, `amount`, `balance`, `payload`, `parameters` e `query` (essa
 última é o que impediria, por exemplo, que um erro bruto do driver do Postgres
 vazasse a query SQL completa com os valores reais nos logs).
 
-**Métricas Prometheus** (`GET /metrics`, formato texto padrão, sem autenticação —
+**Métricas Prometheus** (`GET /metrics`, formato texto padrão, sem autenticação
 mesma categoria dos health checks) via `prom-client`, centralizadas em
 `MetricsService` (`src/infra/observability/`):
 
@@ -356,7 +356,7 @@ mesma categoria dos health checks) via `prom-client`, centralizadas em
 
 `outbox_lag_seconds` e `sqs_dlq_depth` são recalculadas a cada scrape do
 `/metrics` (consulta ao Postgres e ao SQS no momento da requisição), não por um
-loop de background separado — evita manter mais um poll contínuo só para números
+loop de background separado evita manter mais um poll contínuo só para números
 que ninguém está olhando entre um scrape e outro.
 
 Health checks (`/health/live`, `/health/ready`) permanecem como estavam,
@@ -368,14 +368,14 @@ separados de liveness/readiness.
   Prometheus (§10) cobrem o essencial de diagnóstico sem a complexidade de tracing
   distribuído, que não se justificava para o escopo de um único serviço.
 - **Ledger de partidas dobradas (double-entry)**: não implementado (diferencial
-  opcional explícito no desafio — o ledger atual é single-entry por wallet, que
+  opcional explícito no desafio o ledger atual é single-entry por wallet, que
   satisfaz todas as invariantes exigidas).
 - **Reversão parcial**: fora de escopo, conforme o próprio desafio define.
 - **`REVOKE UPDATE/DELETE ON wallet_ledger_entries`**: recomendado para produção
   (defesa em profundidade no nível de permissão do banco), não aplicado na migration
-  para não complicar o setup local do avaliador — a imutabilidade real vem de nenhum
+  para não complicar o setup local do avaliador a imutabilidade real vem de nenhum
   código de aplicação expor um caminho de update para essa tabela.
-- **Teste de carga** (`bun run test:load`): não implementado — diferencial opcional.
+- **Teste de carga** (`bun run test:load`): não implementado diferencial opcional.
 
 ## 12. Testes que fecham cenários específicos da seção 13
 
@@ -390,25 +390,25 @@ testáveis, fora dos workers do NestJS:
   `REVERSAL_WOULD_OVERDRAW`), e a invariante final
   `wallet.balance == saldo reconstruído pelo ledger` depois de uma mistura de
   operações. Foi escrevendo este arquivo que o bug do §6.1 foi encontrado.
-- `test/integration/consumer-sqs-outcomes.spec.ts` — os efeitos REAIS no SQS
+- `test/integration/consumer-sqs-outcomes.spec.ts` os efeitos REAIS no SQS
   das três categorias de erro (§7.1): `applyMessageOutcome` (extraída de
   `WagerTransactionsConsumer.handle()`) é chamada contra um LocalStack real e o
   teste confirma, olhando as filas de verdade, que `ack` deleta da fila
   principal, `dead_letter` publica na DLQ E deleta da principal, e `retry`
   nunca deleta nem manda nada para a DLQ. Até este teste ser escrito, o código
   que decide entre essas três ações nunca tinha sido executado nem uma vez
-  contra infraestrutura real — só a função de decisão (`processIncomingMessage`)
+  contra infraestrutura real só a função de decisão (`processIncomingMessage`)
   tinha cobertura, não a de execução.
 - `test/integration/consumer-crash-recovery.spec.ts` — "worker morto depois do
   commit e antes do ack", testado chamando `processIncomingMessage` duas vezes
   com o mesmo corpo de mensagem (simula a redelivery que o SQS faria de
   verdade), e confirmando que nenhum efeito financeiro se repete.
-- `test/integration/outbox-concurrent-publishers.spec.ts` — "dois publishers
+- `test/integration/outbox-concurrent-publishers.spec.ts` "dois publishers
   concorrentes sobre a mesma outbox" (chamando `publishOutboxBatch` duas vezes
   em paralelo) e "reinício do serviço com comprovação da consistência final"
   (processa transações sem publicar, depois "reinicia" com uma instância nova
   do publisher e confirma reconciliação consistente antes e depois).
-- `test/concurrency/three-instances.spec.ts` — três (e cinco) processos
+- `test/concurrency/three-instances.spec.ts` três (e cinco) processos
   literalmente separados do sistema operacional (via `Bun.spawn`, não apenas
   conexões concorrentes dentro do mesmo processo Bun) disputando a mesma
   wallet, cada um com sua própria conexão independente ao Postgres.
